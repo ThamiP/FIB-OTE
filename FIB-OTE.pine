@@ -1,0 +1,1061 @@
+//@version=6
+indicator("FIB-OTE · Expansion Legs + ICT PD Arrays", shorttitle = "FIB-OTE", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// =====================================================================================================
+//  FIB-OTE
+//  Draws a Fibonacci retracement on the most recent expansion leg and, on that leg, maps ICT PD arrays
+//  (FVG, IFVG, BPR, OB, Breaker, CISD, CISD+OB, MSS, MSS FVG) that sit in the 50% area or the OTE zone.
+//
+//  Leg life-cycle
+//    • A bullish leg runs from its origin/anchor (1.0) to its extreme (0.0). Bearish legs are mirrored.
+//    • While the leg is still expanding, every new extreme simply extends it.
+//    • The extreme locks after N bars without a new extreme (or once price retraces far enough).
+//    • Locked leg + break of the extreme after a real retracement  → NEW leg (continuation), anchored at
+//      the retracement low/high. A shallow retracement just extends the current leg.
+//    • Break of the anchor (failure level)                          → the leg FAILS and a NEW opposite leg
+//      starts from the old extreme.
+//  Only arrays formed on the active leg, pointing in the leg's direction, and located inside the chosen
+//  zone(s) are drawn.
+// =====================================================================================================
+
+// ───────────────────────────────────────────── Inputs ─────────────────────────────────────────────
+string G_LEG = "Expansion legs"
+int    lockBars    = input.int(6, "Leg swing length", minval = 1, maxval = 50, group = G_LEG, tooltip = "Swing size of the legs. The leg extreme locks after this many bars without a new extreme, and a pullback low/high must hold this many bars to become the anchor of the next leg. Larger = bigger, fewer legs.")
+string confirmMode = input.string("Close", "Break confirmation", options = ["Close", "Wick"], group = G_LEG, tooltip = "How price must trade through the leg extreme (new leg) or the leg anchor (failure). 'Close' ignores wick sweeps.")
+float  minRetrace  = input.float(0.382, "Deep pullback re-anchors at", minval = 0.0, maxval = 1.0, step = 0.01, group = G_LEG, tooltip = "When a locked leg's extreme is broken, a NEW leg starts from the pullback low/high if that pullback held for the swing length OR retraced at least this ratio (fast V-shaped pullbacks). Otherwise the current leg is extended.")
+float  minLegATR   = input.float(1.5, "Min new-leg size (× ATR)", minval = 0.0, step = 0.25, group = G_LEG, tooltip = "A continuation leg smaller than this is treated as an extension of the current leg.")
+float  failRatio   = input.float(1.0, "Leg fails beyond ratio", minval = 0.5, maxval = 2.0, step = 0.01, group = G_LEG, tooltip = "1.0 = the leg fails when price breaks its origin. Use e.g. 0.886 to invalidate earlier.")
+int    maxLegs     = input.int(3, "Legs kept on chart", minval = 1, maxval = 20, group = G_LEG, tooltip = "Active leg plus older legs (dimmed).")
+bool   keepFailed  = input.bool(true, "Keep failed legs (dimmed)", group = G_LEG)
+
+string G_FIB = "Fibonacci"
+string fibStr      = input.string("0, 0.5, 0.618, 0.705, 0.79, 1", "Retracement levels", group = G_FIB, tooltip = "Comma separated. 0 = leg extreme, 1 = leg origin.")
+bool   showExt     = input.bool(false, "Extension targets", inline = "ext", group = G_FIB)
+string extStr      = input.string("-0.27, -0.62, -1", "", inline = "ext", group = G_FIB, tooltip = "Negative ratios project beyond the leg extreme.")
+bool   showLvlLbl  = input.bool(true, "Level labels", inline = "lbl", group = G_FIB)
+int    lblOffset   = input.int(8, "offset", minval = 0, maxval = 200, inline = "lbl", group = G_FIB)
+bool   showLegLine = input.bool(true, "Leg line", group = G_FIB)
+color  bullCol     = input.color(#089981, "Bull leg", inline = "lc", group = G_FIB)
+color  bearCol     = input.color(#F23645, "Bear leg", inline = "lc", group = G_FIB)
+
+string G_ZONE = "50% / OTE zones"
+float  oteFrom     = input.float(0.618, "OTE from", minval = 0.0, maxval = 1.0, step = 0.001, inline = "ote", group = G_ZONE)
+float  oteTo       = input.float(0.79, "to", minval = 0.0, maxval = 1.0, step = 0.001, inline = "ote", group = G_ZONE)
+float  eqBand      = input.float(0.05, "50% area ±", minval = 0.0, maxval = 0.25, step = 0.005, group = G_ZONE, tooltip = "Half-width of the equilibrium band around 0.5 (0.05 → 0.45–0.55).")
+bool   showZones   = input.bool(true, "Shade zones", group = G_ZONE)
+color  oteCol      = input.color(color.new(#FF9800, 85), "OTE", inline = "zc", group = G_ZONE)
+color  eqCol       = input.color(color.new(#787B86, 85), "50%", inline = "zc", group = G_ZONE)
+
+string G_FLT = "Array filter"
+string zoneMode    = input.string("50% + OTE", "Arrays must sit in", options = ["50% + OTE", "OTE only", "50% only", "Discount / premium half", "Anywhere in leg"], group = G_FLT)
+string matchMode   = input.string("Overlaps zone", "Match rule", options = ["Overlaps zone", "Midpoint in zone", "Fully in zone"], group = G_FLT)
+string brokenMode  = input.string("Dim", "Invalidated arrays", options = ["Dim", "Hide"], group = G_FLT, tooltip = "An array is invalidated when a candle closes through it against the leg direction.")
+bool   dedupOn     = input.bool(true, "Skip overlapping duplicates", group = G_FLT, tooltip = "Don't draw a new array when a live array of the same type already covers that price on this leg.")
+bool   extendArr   = input.bool(true, "Extend live arrays to the right", group = G_FLT)
+
+string G_ARR = "ICT PD arrays"
+bool   showFVG     = input.bool(true,  "FVG",          inline = "a1", group = G_ARR)
+color  colFVG      = input.color(#2962FF, "",          inline = "a1", group = G_ARR)
+bool   showIFVG    = input.bool(true,  "IFVG",         inline = "a1", group = G_ARR)
+color  colIFVG     = input.color(#9C27B0, "",          inline = "a1", group = G_ARR)
+bool   showBPR     = input.bool(true,  "BPR",          inline = "a1", group = G_ARR)
+color  colBPR      = input.color(#FF9800, "",          inline = "a1", group = G_ARR)
+bool   showMSS     = input.bool(true,  "MSS",          inline = "a2", group = G_ARR)
+color  colMSS      = input.color(#9598A1, "",          inline = "a2", group = G_ARR)
+bool   showMSSFVG  = input.bool(true,  "MSS FVG",      inline = "a2", group = G_ARR)
+color  colMSSFVG   = input.color(#00BCD4, "",          inline = "a2", group = G_ARR)
+bool   showCISD    = input.bool(true,  "CISD",         inline = "a3", group = G_ARR)
+color  colCISD     = input.color(#F7B500, "",          inline = "a3", group = G_ARR)
+bool   showCISDOB  = input.bool(true,  "CISD+OB",      inline = "a3", group = G_ARR)
+color  colCISDOB   = input.color(#4CAF50, "",          inline = "a3", group = G_ARR)
+bool   showBB      = input.bool(true,  "Breaker (BB)", inline = "a4", group = G_ARR)
+color  colBB       = input.color(#E91E63, "",          inline = "a4", group = G_ARR)
+bool   showOB      = input.bool(false, "OB",           inline = "a4", group = G_ARR)
+color  colOB       = input.color(#009688, "",          inline = "a4", group = G_ARR)
+
+string G_DET = "Detection"
+int    intLen      = input.int(3, "Internal structure length", minval = 1, maxval = 20, group = G_DET, tooltip = "Pivot length of the internal swings used for MSS and breaker blocks.")
+float  fvgMinATR   = input.float(0.0, "Min FVG size (× ATR)", minval = 0.0, step = 0.05, group = G_DET)
+int    fvgMaxAge   = input.int(300, "FVG tracking age (bars)", minval = 10, maxval = 1500, group = G_DET, tooltip = "How long an FVG is watched for inversion (IFVG).")
+int    bprLookback = input.int(20, "BPR lookback (bars)", minval = 2, maxval = 300, group = G_DET, tooltip = "Max distance between the two opposing FVGs that form a BPR.")
+int    mssFvgWin   = input.int(3, "MSS FVG window (bars after MSS)", minval = 0, maxval = 20, group = G_DET, tooltip = "FVGs printed in the MSS displacement, or up to this many bars after it, are tagged 'MSS FVG'.")
+int    cisdMinLen  = input.int(1, "CISD min candles in series", minval = 1, maxval = 10, group = G_DET)
+int    cisdMaxAge  = input.int(50, "CISD level expiry (bars)", minval = 5, maxval = 500, group = G_DET)
+int    obSearch    = input.int(5, "OB / breaker candle search", minval = 1, maxval = 20, group = G_DET)
+string obRange     = input.string("Wick", "OB / breaker range", options = ["Wick", "Body"], group = G_DET)
+
+string G_STY = "Style"
+int    arrFill     = input.int(80, "Array fill transparency", minval = 0, maxval = 100, group = G_STY)
+string txtSizeIn   = input.string("Tiny", "Text size", options = ["Tiny", "Small", "Normal"], group = G_STY)
+
+string G_DSH = "Dashboard"
+bool   showDash    = input.bool(true, "Show dashboard", group = G_DSH)
+string dashPosIn   = input.string("Top right", "Position", options = ["Top right", "Bottom right", "Bottom left", "Top left"], group = G_DSH)
+
+string G_ALR = "Alerts"
+bool   alertsOn    = input.bool(true, "Detailed alert() messages", group = G_ALR, tooltip = "Create an alert with 'Any alert() function call' to receive leg, zone and array messages. Separate alertcondition() events are also available.")
+
+// ───────────────────────────────────────────── Constants ─────────────────────────────────────────────
+int K_FVG    = 0
+int K_IFVG   = 1
+int K_BPR    = 2
+int K_OB     = 3
+int K_BB     = 4
+int K_CISD   = 5
+int K_CISDOB = 6
+int K_MSS    = 7
+int K_MSSFVG = 8
+
+int MAXLOOK     = 1500   // max bars scanned back when locating leg anchors/extremes
+int MAX_LEG_ARR = 200    // candidate arrays tracked per leg
+int MAX_POOL    = 400    // recent raw detections kept for seeding new legs
+int MAX_FVG     = 150    // FVGs watched for inversion / BPR
+int XBACK       = 9000   // clamp for bar_index based drawing coordinates
+
+max_bars_back(high,  1550)
+max_bars_back(low,   1550)
+max_bars_back(open,  1550)
+max_bars_back(close, 1550)
+
+string txtSize = switch txtSizeIn
+    "Small"  => size.small
+    "Normal" => size.normal
+    => size.tiny
+
+string dashPos = switch dashPosIn
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Top left"     => position.top_left
+    => position.top_right
+
+// ───────────────────────────────────────────── Types ─────────────────────────────────────────────
+// One PD array. For line kinds (CISD, MSS) `lvl` is the drawn level and top/bot span the reversal.
+type PDArray
+    int   kind
+    int   dir
+    float top
+    float bot
+    float lvl
+    int   left
+    int   bar
+    bool  qual     = false
+    bool  broken   = false
+    int   brokeBar
+    bool  dimmed   = false
+    bool  touched  = false
+    bool  alerted  = false
+    int   dk       = -1
+    box   bx
+    line  ln
+    label lb
+
+// One expansion leg with its Fibonacci drawing and candidate arrays.
+type Leg
+    int   id
+    int   dir
+    float a
+    int   aBar
+    float e
+    int   eBar
+    bool  locked = false
+    bool  failed = false
+    float rx
+    int   rxBar
+    float eqLo
+    float eqHi
+    float oteLo
+    float oteHi
+    float z1Lo
+    float z1Hi
+    float z2Lo
+    float z2Hi
+    bool  hitOTE = false
+    bool  hitEQ  = false
+    array<line>    lvLines
+    array<label>   lvLabels
+    box   oteBox
+    box   eqBox
+    line  legLine
+    label tag
+    label failTag
+    array<PDArray> arrs
+
+// ───────────────────────────────────────────── State ─────────────────────────────────────────────
+var array<float>   RATIOS = array.new<float>()
+var array<string>  KNAME  = array.from("FVG", "IFVG", "BPR", "OB", "BB", "CISD", "CISD+OB", "MSS", "MSS FVG")
+var array<color>   KCOL   = array.from(colFVG, colIFVG, colBPR, colOB, colBB, colCISD, colCISDOB, colMSS, colMSSFVG)
+var array<bool>    KON    = array.from(showFVG, showIFVG, showBPR, showOB, showBB, showCISD, showCISDOB, showMSS, showMSSFVG)
+var array<PDArray> pool   = array.new<PDArray>()
+var array<PDArray> fvgs   = array.new<PDArray>()
+var array<Leg>     legs   = array.new<Leg>()
+var Leg            cur    = na
+var int            legSeq = 0
+
+// ───────────────────────────────────────────── Helpers ─────────────────────────────────────────────
+parseLevels(string s) =>
+    array<float>  out   = array.new<float>()
+    array<string> parts = str.split(s, ",")
+    for p in parts
+        float v = str.tonumber(str.replace_all(p, " ", ""))
+        if not na(v)
+            out.push(v)
+    out
+
+legCol(int d)     => d == 1 ? bullCol : bearCol
+cx(int x)         => math.max(x, bar_index - XBACK)
+isLineKind(int k) => k == K_CISD or k == K_MSS
+effKind(int k)    => k == K_MSSFVG and not showMSSFVG ? K_FVG : k
+kindOn(int k)     => KON.get(k)
+kindCol(int k)    => KCOL.get(k)
+kindName(int k)   => KNAME.get(k)
+
+levelColor(float r, int d) =>
+    color c = legCol(d)
+    if r >= math.min(oteFrom, oteTo) - 1e-9 and r <= math.max(oteFrom, oteTo) + 1e-9
+        c := color.new(oteCol, 0)
+    else if math.abs(r - 0.5) < 1e-9
+        c := color.new(eqCol, 0)
+    else if r < 0
+        c := color.new(legCol(d), 35)
+    c
+
+levelStyle(float r) => r == 0 or r == 1 ? line.style_solid : r < 0 ? line.style_dotted : line.style_dashed
+
+fmtLevel(float r, float y) => str.tostring(r) + "  (" + str.tostring(y, format.mintick) + ")"
+
+// Highest high (dir = 1) or lowest low (dir = -1) from `fromBar` through the current bar.
+f_extSince(int fromBar, int dir) =>
+    int   n = math.max(0, math.min(bar_index - fromBar, MAXLOOK))
+    float p = dir == 1 ? high : low
+    int   b = bar_index
+    if n > 0
+        for i = 1 to n
+            float v = dir == 1 ? high[i] : low[i]
+            if dir == 1 ? v > p : v < p
+                p := v
+                b := bar_index - i
+    [p, b]
+
+inZone(PDArray a, float lo, float hi) =>
+    bool res = false
+    if not na(lo) and not na(hi)
+        float mid = (a.top + a.bot) / 2
+        res := switch matchMode
+            "Midpoint in zone" => mid >= lo and mid <= hi
+            "Fully in zone"    => a.top <= hi and a.bot >= lo
+            => a.top >= lo and a.bot <= hi
+    res
+
+// ───────────────────────────────────────────── PD array methods ─────────────────────────────────────────────
+method undraw(PDArray this) =>
+    if not na(this.bx)
+        this.bx.delete()
+        this.bx := box(na)
+    if not na(this.ln)
+        this.ln.delete()
+        this.ln := line(na)
+    if not na(this.lb)
+        this.lb.delete()
+        this.lb := label(na)
+    this.qual   := false
+    this.dimmed := false
+    this
+
+method draw(PDArray this) =>
+    int    k = effKind(this.kind)
+    color  c = kindCol(k)
+    string t = kindName(k)
+    if isLineKind(k)
+        int x1 = cx(this.left)
+        this.ln := line.new(x1, this.lvl, this.bar, this.lvl, color = c, style = line.style_dashed, width = 2)
+        this.lb := label.new(math.round((x1 + this.bar) / 2), this.lvl, t, style = this.dir == 1 ? label.style_label_down : label.style_label_up, color = color(na), textcolor = c, size = txtSize)
+    else
+        int x2 = this.broken and not na(this.brokeBar) ? this.brokeBar : extendArr ? bar_index : math.max(this.bar, this.left + 5)
+        this.bx := box.new(cx(this.left), this.top, x2, this.bot, border_color = color.new(c, 30), bgcolor = color.new(c, arrFill), text = t, text_color = c, text_size = txtSize, text_halign = text.align_right, text_valign = text.align_center)
+    this.dk   := k
+    this.qual := true
+    this
+
+method dim(PDArray this, int tFill, int tLine, int tText, bool dotted) =>
+    color c = kindCol(this.dk < 0 ? this.kind : this.dk)
+    if not na(this.bx)
+        this.bx.set_bgcolor(color.new(c, tFill))
+        this.bx.set_border_color(color.new(c, tLine))
+        this.bx.set_text_color(color.new(c, tText))
+        if dotted
+            this.bx.set_border_style(line.style_dotted)
+    if not na(this.ln)
+        this.ln.set_color(color.new(c, tLine))
+        if dotted
+            this.ln.set_style(line.style_dotted)
+    if not na(this.lb)
+        this.lb.set_textcolor(color.new(c, tText))
+    this
+
+// Replays the bars since the array formed to recover its touched / invalidated state.
+method syncHistory(PDArray this) =>
+    int n = math.min(bar_index - this.bar - 1, MAXLOOK)
+    if n > 0
+        for i = n to 1
+            if this.dir == 1
+                if low[i] <= this.top
+                    this.touched := true
+                if not this.broken and close[i] < this.bot
+                    this.broken   := true
+                    this.brokeBar := bar_index - i
+            else
+                if high[i] >= this.bot
+                    this.touched := true
+                if not this.broken and close[i] > this.top
+                    this.broken   := true
+                    this.brokeBar := bar_index - i
+    this
+
+// ───────────────────────────────────────────── Leg methods ─────────────────────────────────────────────
+method price(Leg this, float r) =>
+    this.e - this.dir * r * math.abs(this.e - this.a)
+
+method calcZones(Leg this) =>
+    float q1 = this.price(0.5 - eqBand)
+    float q2 = this.price(0.5 + eqBand)
+    this.eqLo := math.min(q1, q2)
+    this.eqHi := math.max(q1, q2)
+    float o1 = this.price(oteFrom)
+    float o2 = this.price(oteTo)
+    this.oteLo := math.min(o1, o2)
+    this.oteHi := math.max(o1, o2)
+    this.z2Lo  := na
+    this.z2Hi  := na
+    switch zoneMode
+        "OTE only" =>
+            this.z1Lo := this.oteLo
+            this.z1Hi := this.oteHi
+        "50% only" =>
+            this.z1Lo := this.eqLo
+            this.z1Hi := this.eqHi
+        "Discount / premium half" =>
+            this.z1Lo := math.min(this.price(0.5), this.a)
+            this.z1Hi := math.max(this.price(0.5), this.a)
+        "Anywhere in leg" =>
+            this.z1Lo := math.min(this.a, this.e)
+            this.z1Hi := math.max(this.a, this.e)
+        =>
+            this.z1Lo := this.eqLo
+            this.z1Hi := this.eqHi
+            this.z2Lo := this.oteLo
+            this.z2Hi := this.oteHi
+    this
+
+method qualifies(Leg this, PDArray a) =>
+    a.dir == this.dir and (inZone(a, this.z1Lo, this.z1Hi) or inZone(a, this.z2Lo, this.z2Hi))
+
+// Zones only move toward the extreme as a leg extends, so an array that is already fully behind the
+// deepest zone can never qualify for this leg again.
+method isDead(Leg this, PDArray a) =>
+    float lo = na(this.z2Lo) ? this.z1Lo : math.min(this.z1Lo, this.z2Lo)
+    float hi = na(this.z2Hi) ? this.z1Hi : math.max(this.z1Hi, this.z2Hi)
+    a.dir != this.dir or (this.dir == 1 ? a.top < lo : a.bot > hi)
+
+// A live, drawn array of the same type already covering this price range.
+method hasTwin(Leg this, PDArray a) =>
+    bool found = false
+    int  k     = effKind(a.kind)
+    for b in this.arrs
+        if b.qual and not b.broken and b.dk == k and b.top >= a.bot and b.bot <= a.top
+            found := true
+            break
+    found
+
+method zoneOf(Leg this, PDArray a) =>
+    inZone(a, this.oteLo, this.oteHi) ? "OTE" : inZone(a, this.eqLo, this.eqHi) ? "50% area" : zoneMode == "Discount / premium half" ? (this.dir == 1 ? "discount" : "premium") : "leg"
+
+method initFib(Leg this) =>
+    color c  = legCol(this.dir)
+    int   x1 = cx(this.aBar)
+    int   x2 = bar_index + lblOffset
+    for r in RATIOS
+        float y  = this.price(r)
+        color lc = levelColor(r, this.dir)
+        this.lvLines.push(line.new(x1, y, x2, y, color = lc, style = levelStyle(r), width = 1))
+        if showLvlLbl
+            this.lvLabels.push(label.new(x2, y, fmtLevel(r, y), style = label.style_label_left, color = color(na), textcolor = lc, size = txtSize))
+    if showZones
+        this.oteBox := box.new(cx(this.eBar), this.oteHi, x2, this.oteLo, border_color = color(na), bgcolor = oteCol)
+        this.eqBox  := box.new(cx(this.eBar), this.eqHi, x2, this.eqLo, border_color = color(na), bgcolor = eqCol)
+    if showLegLine
+        this.legLine := line.new(x1, this.a, cx(this.eBar), this.e, color = color.new(c, 40), style = line.style_dotted, width = 2)
+    this.tag := label.new(x1, this.a, (this.dir == 1 ? "▲ Leg " : "▼ Leg ") + str.tostring(this.id), style = this.dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(c, 80), textcolor = c, size = txtSize)
+    this
+
+method updateFib(Leg this, int xEnd) =>
+    int x1 = cx(this.aBar)
+    int n  = this.lvLines.size()
+    if n > 0
+        for i = 0 to n - 1
+            float r = RATIOS.get(i)
+            float y = this.price(r)
+            this.lvLines.get(i).set_xy1(x1, y)
+            this.lvLines.get(i).set_xy2(xEnd, y)
+            if i < this.lvLabels.size()
+                label lb = this.lvLabels.get(i)
+                lb.set_xy(xEnd, y)
+                lb.set_text(fmtLevel(r, y))
+    if not na(this.oteBox)
+        this.oteBox.set_lefttop(cx(this.eBar), this.oteHi)
+        this.oteBox.set_rightbottom(xEnd, this.oteLo)
+    if not na(this.eqBox)
+        this.eqBox.set_lefttop(cx(this.eBar), this.eqHi)
+        this.eqBox.set_rightbottom(xEnd, this.eqLo)
+    if not na(this.legLine)
+        this.legLine.set_xy1(x1, this.a)
+        this.legLine.set_xy2(cx(this.eBar), this.e)
+    if not na(this.tag)
+        this.tag.set_xy(x1, this.a)
+    this
+
+// Copies recent detections that belong to this leg (formed at/after its anchor, same direction).
+method seed(Leg this) =>
+    int n = pool.size()
+    if n > 0
+        for i = n - 1 to 0
+            PDArray p = pool.get(i)
+            if p.bar < this.aBar
+                break
+            if p.dir == this.dir
+                PDArray c = p.copy()
+                c.qual     := false
+                c.broken   := false
+                c.brokeBar := na
+                c.dimmed   := false
+                c.touched  := false
+                c.alerted  := true
+                c.dk       := -1
+                c.bx       := box(na)
+                c.ln       := line(na)
+                c.lb       := label(na)
+                c.syncHistory()
+                this.arrs.unshift(c)
+    this
+
+// Per-bar pass over the active leg's candidates: invalidate, (re)qualify, draw, extend, alert.
+method process(Leg this) =>
+    bool   anyNew = false
+    bool   anyTap = false
+    string msg    = ""
+    int    n      = this.arrs.size()
+    if n > 0
+        for i = n - 1 to 0
+            PDArray a    = this.arrs.get(i)
+            bool    drop = false
+            if not a.broken and bar_index > a.bar
+                if (a.dir == 1 and close < a.bot) or (a.dir == -1 and close > a.top)
+                    a.broken   := true
+                    a.brokeBar := bar_index
+            bool tapNow = false
+            if not a.touched and bar_index > a.bar
+                if (a.dir == 1 and low <= a.top) or (a.dir == -1 and high >= a.bot)
+                    a.touched := true
+                    tapNow    := true
+            bool q   = kindOn(effKind(a.kind)) and this.qualifies(a) and not (a.broken and brokenMode == "Hide")
+            bool dup = q and not a.qual and dedupOn and this.hasTwin(a)
+            if dup
+                drop := true
+            else
+                if q and not a.qual
+                    a.draw()
+                    if not a.alerted and a.bar == bar_index
+                        a.alerted := true
+                        anyNew    := true
+                        msg += (a.dir == 1 ? "▲ " : "▼ ") + kindName(a.dk) + " formed in " + this.zoneOf(a) + " of leg " + str.tostring(this.id) + " @ " + str.tostring(a.bot, format.mintick) + " – " + str.tostring(a.top, format.mintick) + "\n"
+                else if not q and a.qual
+                    a.undraw()
+                if a.qual
+                    if a.dk != effKind(a.kind)
+                        a.undraw()
+                        a.draw()
+                    if a.broken
+                        if not a.dimmed
+                            if not na(a.bx)
+                                a.bx.set_right(a.brokeBar)
+                            a.dim(94, 70, 60, true)
+                            a.dimmed := true
+                    else
+                        if extendArr and not na(a.bx) and barstate.islast
+                            a.bx.set_right(bar_index)
+                        if tapNow and this.locked
+                            anyTap := true
+                            msg += "Price tapped " + (a.dir == 1 ? "▲ " : "▼ ") + kindName(a.dk) + " in " + this.zoneOf(a) + " of leg " + str.tostring(this.id) + " @ " + str.tostring(a.bot, format.mintick) + " – " + str.tostring(a.top, format.mintick) + "\n"
+                else if a.broken or this.isDead(a)
+                    drop := true
+            if drop
+                this.arrs.remove(i)
+    [anyNew, anyTap, msg]
+
+// Freezes a leg that has been replaced: stop extending, dim, drop undrawn candidates.
+method retire(Leg this, bool failed) =>
+    this.failed := failed
+    color c  = legCol(this.dir)
+    int   x1 = cx(this.aBar)
+    int   n  = this.lvLines.size()
+    if n > 0
+        for i = 0 to n - 1
+            float r  = RATIOS.get(i)
+            float y  = this.price(r)
+            line  ln = this.lvLines.get(i)
+            ln.set_xy1(x1, y)
+            ln.set_xy2(bar_index, y)
+            ln.set_color(color.new(levelColor(r, this.dir), failed ? 75 : 55))
+            if failed
+                ln.set_style(line.style_dotted)
+    for lb in this.lvLabels
+        lb.delete()
+    this.lvLabels.clear()
+    if not na(this.oteBox)
+        this.oteBox.set_lefttop(cx(this.eBar), this.oteHi)
+        this.oteBox.set_rightbottom(bar_index, this.oteLo)
+        this.oteBox.set_bgcolor(color.new(oteCol, math.min(100, color.t(oteCol) + 7)))
+    if not na(this.eqBox)
+        this.eqBox.set_lefttop(cx(this.eBar), this.eqHi)
+        this.eqBox.set_rightbottom(bar_index, this.eqLo)
+        this.eqBox.set_bgcolor(color.new(eqCol, math.min(100, color.t(eqCol) + 7)))
+    if not na(this.legLine)
+        this.legLine.set_xy2(cx(this.eBar), this.e)
+        this.legLine.set_color(color.new(c, 75))
+    if not na(this.tag)
+        this.tag.set_color(color.new(c, 92))
+        this.tag.set_textcolor(color.new(c, 50))
+    if failed
+        this.failTag := label.new(bar_index, this.a, "✕ Leg " + str.tostring(this.id) + " failed", style = this.dir == 1 ? label.style_label_up : label.style_label_down, color = color(na), textcolor = color.new(c, 25), size = txtSize)
+    int m = this.arrs.size()
+    if m > 0
+        for i = m - 1 to 0
+            PDArray a = this.arrs.get(i)
+            if not a.qual
+                this.arrs.remove(i)
+            else if not a.broken
+                if not na(a.bx)
+                    a.bx.set_right(bar_index)
+                a.dim(90, 60, 45, false)
+    this
+
+method destroy(Leg this) =>
+    for ln in this.lvLines
+        ln.delete()
+    for lb in this.lvLabels
+        lb.delete()
+    if not na(this.oteBox)
+        this.oteBox.delete()
+    if not na(this.eqBox)
+        this.eqBox.delete()
+    if not na(this.legLine)
+        this.legLine.delete()
+    if not na(this.tag)
+        this.tag.delete()
+    if not na(this.failTag)
+        this.failTag.delete()
+    for a in this.arrs
+        a.undraw()
+    this
+
+// Registers a detection: keeps a raw copy for future legs and hands a live copy to the active leg.
+addArray(PDArray a) =>
+    pool.push(a)
+    if pool.size() > MAX_POOL
+        pool.shift()
+    if not na(cur)
+        if a.dir == cur.dir and a.bar >= cur.aBar
+            cur.arrs.push(a.copy())
+            if cur.arrs.size() > MAX_LEG_ARR
+                int idx = 0
+                for j = 0 to cur.arrs.size() - 1
+                    if not cur.arrs.get(j).qual
+                        idx := j
+                        break
+                cur.arrs.remove(idx).undraw()
+    a
+
+// Tags the FVGs printed inside an MSS displacement (from its origin swing onward) as "MSS FVG".
+upgradeMss(int d, int fromBar) =>
+    int n = pool.size()
+    if n > 0
+        for i = n - 1 to 0
+            PDArray p = pool.get(i)
+            if p.bar < fromBar
+                break
+            if p.kind == K_FVG and p.dir == d and p.left >= fromBar
+                p.kind := K_MSSFVG
+    if not na(cur)
+        for a in cur.arrs
+            if a.kind == K_FVG and a.dir == d and a.left >= fromBar
+                a.kind := K_MSSFVG
+    true
+
+if barstate.isfirst
+    RATIOS.concat(parseLevels(fibStr))
+    if showExt
+        RATIOS.concat(parseLevels(extStr))
+
+// ───────────────────────────────────────────── Core series ─────────────────────────────────────────────
+float atrv     = nz(ta.atr(14), high - low)
+bool  useClose = confirmMode == "Close"
+
+float sph = ta.pivothigh(high, lockBars, lockBars)
+float spl = ta.pivotlow(low, lockBars, lockBars)
+float iph = ta.pivothigh(high, intLen, intLen)
+float ipl = ta.pivotlow(low, intLen, intLen)
+
+var float swH  = na
+var int   swHB = na
+var float swL  = na
+var int   swLB = na
+if not na(sph)
+    swH  := sph
+    swHB := bar_index - lockBars
+if not na(spl)
+    swL  := spl
+    swLB := bar_index - lockBars
+
+string alertTxt = ""
+bool   evBull   = false
+bool   evBear   = false
+bool   evFail   = false
+bool   evOTE    = false
+bool   evEQ     = false
+bool   evArr    = false
+bool   evTap    = false
+
+// ───────────────────────────────────────────── Leg engine ─────────────────────────────────────────────
+bool  mkLeg     = false
+bool  failedNow = false
+bool  fibDirty  = false
+int   nDir      = 0
+float nA        = na
+int   nAB       = na
+float nE        = na
+int   nEB       = na
+
+if na(cur)
+    // First leg: the first close through a confirmed swing.
+    if not na(swH) and close > swH
+        [bA, bAB] = f_extSince(swHB, -1)
+        [bE, bEB] = f_extSince(bAB, 1)
+        mkLeg := true
+        nDir  := 1
+        nA    := bA
+        nAB   := bAB
+        nE    := bE
+        nEB   := bEB
+    else if not na(swL) and close < swL
+        [sA, sAB] = f_extSince(swLB, 1)
+        [sE, sEB] = f_extSince(sAB, -1)
+        mkLeg := true
+        nDir  := -1
+        nA    := sA
+        nAB   := sAB
+        nE    := sE
+        nEB   := sEB
+else
+    int   d       = cur.dir
+    float R       = math.abs(cur.e - cur.a)
+    float failLvl = cur.e - d * failRatio * R
+    float pFail   = useClose ? close : d == 1 ? low : high
+    float pExt    = useClose ? close : d == 1 ? high : low
+    bool  brkFail = d == 1 ? pFail < failLvl : pFail > failLvl
+    bool  brkExt  = d == 1 ? pExt > cur.e : pExt < cur.e
+    if brkFail
+        // Leg failed → new opposite leg from the old extreme (or any sweep beyond it).
+        failedNow := true
+        [fA, fAB] = f_extSince(cur.aBar, d)
+        [fE, fEB] = f_extSince(fAB, -d)
+        mkLeg := true
+        nDir  := -d
+        nA    := fA
+        nAB   := fAB
+        nE    := fE
+        nEB   := fEB
+    else if not cur.locked and (d == 1 ? high > cur.e : low < cur.e)
+        // Still expanding → extend.
+        cur.e     := d == 1 ? high : low
+        cur.eBar  := bar_index
+        cur.rx    := na
+        cur.rxBar := na
+        fibDirty  := true
+    else if cur.locked and brkExt
+        // Extreme broken after the leg locked → new leg if the pullback was real, else extend.
+        bool reanchor = false
+        if not na(cur.rx) and R > 0
+            [cE, cEB] = f_extSince(cur.rxBar, d)
+            float depth   = math.abs(cur.e - cur.rx) / R
+            bool  swingOK = bar_index - cur.rxBar >= lockBars
+            if (swingOK or depth >= minRetrace) and math.abs(cE - cur.rx) >= minLegATR * atrv
+                reanchor := true
+                mkLeg    := true
+                nDir     := d
+                nA       := cur.rx
+                nAB      := cur.rxBar
+                nE       := cE
+                nEB      := cEB
+        if not reanchor
+            [xE, xEB] = f_extSince(cur.eBar, d)
+            cur.e      := xE
+            cur.eBar   := xEB
+            cur.locked := false
+            cur.rx     := na
+            cur.rxBar  := na
+            if xEB < bar_index
+                [xR, xRB] = f_extSince(xEB + 1, -d)
+                cur.rx    := xR
+                cur.rxBar := xRB
+            fibDirty := true
+
+// Retracement tracking and extreme lock for the ongoing leg.
+if not na(cur) and not mkLeg
+    int dd = cur.dir
+    if bar_index > cur.eBar
+        float rv = dd == 1 ? low : high
+        if na(cur.rx) or (dd == 1 ? rv < cur.rx : rv > cur.rx)
+            cur.rx    := rv
+            cur.rxBar := bar_index
+    if not cur.locked
+        float R2  = math.abs(cur.e - cur.a)
+        float dep = na(cur.rx) or R2 == 0 ? 0.0 : math.abs(cur.e - cur.rx) / R2
+        if bar_index - cur.eBar >= lockBars or dep >= minRetrace
+            cur.locked := true
+
+// Start a new leg.
+if mkLeg and not na(nA) and not na(nE) and nA != nE
+    if not na(cur)
+        cur.retire(failedNow)
+        if failedNow
+            evFail   := true
+            alertTxt += "Leg " + str.tostring(cur.id) + " failed\n"
+            if not keepFailed
+                cur.destroy()
+                if legs.size() > 0
+                    legs.pop()
+    legSeq += 1
+    Leg L = Leg.new(id = legSeq, dir = nDir, a = nA, aBar = nAB, e = nE, eBar = nEB, lvLines = array.new<line>(), lvLabels = array.new<label>(), arrs = array.new<PDArray>())
+    if nEB < bar_index
+        [iR, iRB] = f_extSince(nEB + 1, -nDir)
+        L.rx    := iR
+        L.rxBar := iRB
+    L.calcZones()
+    L.initFib()
+    L.seed()
+    legs.push(L)
+    while legs.size() > maxLegs
+        legs.shift().destroy()
+    cur      := L
+    fibDirty := true
+    evBull   := nDir == 1
+    evBear   := nDir == -1
+    alertTxt += (nDir == 1 ? "New bullish leg " : "New bearish leg ") + str.tostring(legSeq) + ": " + str.tostring(nA, format.mintick) + " → " + str.tostring(nE, format.mintick) + "\n"
+
+// ───────────────────────────────────────────── PD array detection ─────────────────────────────────────────────
+// IFVG: an FVG that gets closed through flips into an inversion FVG in the other direction.
+if fvgs.size() > 0
+    int keepAge = math.max(fvgMaxAge, bprLookback)
+    for i = fvgs.size() - 1 to 0
+        PDArray g = fvgs.get(i)
+        if bar_index - g.bar > keepAge
+            fvgs.remove(i)
+        else if not g.broken and bar_index > g.bar
+            if g.dir == 1 and close < g.bot
+                g.broken := true
+                if showIFVG
+                    addArray(PDArray.new(K_IFVG, -1, g.top, g.bot, na, g.left, bar_index))
+            else if g.dir == -1 and close > g.top
+                g.broken := true
+                if showIFVG
+                    addArray(PDArray.new(K_IFVG, 1, g.top, g.bot, na, g.left, bar_index))
+
+var int lastMssUp = na
+var int lastMssDn = na
+var int lastObUp  = -1
+var int lastObDn  = -1
+
+bool gapUp = low > high[2] and low - high[2] >= fvgMinATR * atrv
+bool gapDn = high < low[2] and low[2] - high >= fvgMinATR * atrv
+
+if gapUp
+    PDArray f = PDArray.new(bar_index - lastMssUp <= mssFvgWin ? K_MSSFVG : K_FVG, 1, low, high[2], na, bar_index - 1, bar_index)
+    // BPR: overlap with a recent bearish FVG.
+    if showBPR and fvgs.size() > 0
+        for i = fvgs.size() - 1 to 0
+            PDArray o = fvgs.get(i)
+            if bar_index - o.bar > bprLookback
+                break
+            if o.dir == -1
+                float bt = math.min(f.top, o.top)
+                float bb = math.max(f.bot, o.bot)
+                if bt > bb
+                    addArray(PDArray.new(K_BPR, 1, bt, bb, na, o.left, bar_index))
+                    break
+    fvgs.push(f)
+    if fvgs.size() > MAX_FVG
+        fvgs.shift()
+    addArray(f)
+    // OB: last down-close candle before the displacement that printed the FVG.
+    if showOB
+        for k = 2 to obSearch + 1
+            if close[k] < open[k]
+                if bar_index - k != lastObUp
+                    lastObUp := bar_index - k
+                    addArray(PDArray.new(K_OB, 1, obRange == "Wick" ? high[k] : open[k], obRange == "Wick" ? low[k] : close[k], na, bar_index - k, bar_index))
+                break
+
+if gapDn
+    PDArray f = PDArray.new(bar_index - lastMssDn <= mssFvgWin ? K_MSSFVG : K_FVG, -1, low[2], high, na, bar_index - 1, bar_index)
+    if showBPR and fvgs.size() > 0
+        for i = fvgs.size() - 1 to 0
+            PDArray o = fvgs.get(i)
+            if bar_index - o.bar > bprLookback
+                break
+            if o.dir == 1
+                float bt = math.min(f.top, o.top)
+                float bb = math.max(f.bot, o.bot)
+                if bt > bb
+                    addArray(PDArray.new(K_BPR, -1, bt, bb, na, o.left, bar_index))
+                    break
+    fvgs.push(f)
+    if fvgs.size() > MAX_FVG
+        fvgs.shift()
+    addArray(f)
+    if showOB
+        for k = 2 to obSearch + 1
+            if close[k] > open[k]
+                if bar_index - k != lastObDn
+                    lastObDn := bar_index - k
+                    addArray(PDArray.new(K_OB, -1, obRange == "Wick" ? high[k] : close[k], obRange == "Wick" ? low[k] : open[k], na, bar_index - k, bar_index))
+                break
+
+// CISD: close back through the OPEN of the opposing delivery series (the run of candles into the extreme).
+// CISD+OB: that same series treated as the order block (open of the first candle → series extreme).
+bool isUp  = close > open
+bool isDn  = close < open
+bool wasUp = close[1] > open[1]
+bool wasDn = close[1] < open[1]
+
+var float dsOpen = na
+var int   dsBar  = na
+var float dsLow  = na
+var float dsLowB = na
+var int   dsLen  = 0
+var float cuLvl  = na
+var int   cuBar  = na
+var float cuLow  = na
+var float cuLowB = na
+var int   cuLen  = 0
+
+var float usOpen  = na
+var int   usBar   = na
+var float usHigh  = na
+var float usHighB = na
+var int   usLen   = 0
+var float cdLvl   = na
+var int   cdBar   = na
+var float cdHigh  = na
+var float cdHighB = na
+var int   cdLen   = 0
+
+if isDn
+    if not wasDn
+        dsOpen := open
+        dsBar  := bar_index
+        dsLow  := low
+        dsLowB := close
+        dsLen  := 1
+    else
+        dsLow  := math.min(dsLow, low)
+        dsLowB := math.min(dsLowB, close)
+        dsLen  += 1
+    if na(cuLvl) or dsBar == cuBar or dsLow < cuLow
+        cuLvl  := dsOpen
+        cuBar  := dsBar
+        cuLow  := dsLow
+        cuLowB := dsLowB
+        cuLen  := dsLen
+
+if isUp
+    if not wasUp
+        usOpen  := open
+        usBar   := bar_index
+        usHigh  := high
+        usHighB := close
+        usLen   := 1
+    else
+        usHigh  := math.max(usHigh, high)
+        usHighB := math.max(usHighB, close)
+        usLen   += 1
+    if na(cdLvl) or usBar == cdBar or usHigh > cdHigh
+        cdLvl   := usOpen
+        cdBar   := usBar
+        cdHigh  := usHigh
+        cdHighB := usHighB
+        cdLen   := usLen
+
+if not na(cuLvl) and bar_index - cuBar > cisdMaxAge
+    cuLvl := na
+if not na(cdLvl) and bar_index - cdBar > cisdMaxAge
+    cdLvl := na
+
+if not na(cuLvl) and not isDn and close > cuLvl and bar_index > cuBar and cuLen >= cisdMinLen
+    if showCISD
+        addArray(PDArray.new(K_CISD, 1, cuLvl, cuLow, cuLvl, cuBar, bar_index))
+    if showCISDOB
+        addArray(PDArray.new(K_CISDOB, 1, cuLvl, obRange == "Wick" ? cuLow : cuLowB, na, cuBar, bar_index))
+    cuLvl := na
+
+if not na(cdLvl) and not isUp and close < cdLvl and bar_index > cdBar and cdLen >= cisdMinLen
+    if showCISD
+        addArray(PDArray.new(K_CISD, -1, cdHigh, cdLvl, cdLvl, cdBar, bar_index))
+    if showCISDOB
+        addArray(PDArray.new(K_CISDOB, -1, obRange == "Wick" ? cdHigh : cdHighB, cdLvl, na, cdBar, bar_index))
+    cdLvl := na
+
+// MSS: internal structure break against the prevailing internal trend.
+// Breaker: the swing's opposing candle when the break follows a sweep of the prior internal swing.
+var float ihP     = na
+var int   ihB     = na
+var bool  ihDone  = true
+var float ihPrevL = na
+var float ilP     = na
+var int   ilB     = na
+var bool  ilDone  = true
+var float ilPrevH = na
+var int   iTrend  = 0
+
+if not na(iph)
+    ihPrevL := ilP
+    ihP     := iph
+    ihB     := bar_index - intLen
+    ihDone  := false
+if not na(ipl)
+    ilPrevH := ihP
+    ilP     := ipl
+    ilB     := bar_index - intLen
+    ilDone  := false
+
+if not ihDone and close > ihP
+    ihDone := true
+    [oL, oLB] = f_extSince(ihB, -1)
+    if iTrend == -1
+        lastMssUp := bar_index
+        upgradeMss(1, oLB)
+        if showMSS
+            addArray(PDArray.new(K_MSS, 1, ihP, oL, ihP, ihB, bar_index))
+    iTrend := 1
+    int off0 = bar_index - ihB
+    if showBB and not na(ihPrevL) and oL < ihPrevL and off0 + obSearch < MAXLOOK
+        for j = 0 to obSearch - 1
+            int k = off0 + j
+            if close[k] > open[k]
+                addArray(PDArray.new(K_BB, 1, obRange == "Wick" ? high[k] : close[k], obRange == "Wick" ? low[k] : open[k], na, bar_index - k, bar_index))
+                break
+
+if not ilDone and close < ilP
+    ilDone := true
+    [oH, oHB] = f_extSince(ilB, 1)
+    if iTrend == 1
+        lastMssDn := bar_index
+        upgradeMss(-1, oHB)
+        if showMSS
+            addArray(PDArray.new(K_MSS, -1, oH, ilP, ilP, ilB, bar_index))
+    iTrend := -1
+    int off1 = bar_index - ilB
+    if showBB and not na(ilPrevH) and oH > ilPrevH and off1 + obSearch < MAXLOOK
+        for j = 0 to obSearch - 1
+            int k = off1 + j
+            if close[k] < open[k]
+                addArray(PDArray.new(K_BB, -1, obRange == "Wick" ? high[k] : open[k], obRange == "Wick" ? low[k] : close[k], na, bar_index - k, bar_index))
+                break
+
+// ───────────────────────────────────────────── Active leg: filter, draw, extend ─────────────────────────────────────────────
+if not na(cur)
+    if fibDirty
+        cur.calcZones()
+        cur.hitOTE := false
+        cur.hitEQ  := false
+    [qNew, qTap, qMsg] = cur.process()
+    evArr    := qNew
+    evTap    := qTap
+    alertTxt += qMsg
+    if fibDirty or barstate.islast
+        cur.updateFib(bar_index + lblOffset)
+    if cur.locked
+        string legTxt = (cur.dir == 1 ? "bullish" : "bearish") + " leg " + str.tostring(cur.id)
+        if not cur.hitOTE and (cur.dir == 1 ? low <= cur.oteHi : high >= cur.oteLo)
+            cur.hitOTE := true
+            evOTE      := true
+            alertTxt   += "Price reached the OTE of " + legTxt + " (" + str.tostring(cur.oteLo, format.mintick) + " – " + str.tostring(cur.oteHi, format.mintick) + ")\n"
+        if not cur.hitEQ and (cur.dir == 1 ? low <= cur.eqHi : high >= cur.eqLo)
+            cur.hitEQ := true
+            evEQ      := true
+            alertTxt  += "Price reached the 50% area of " + legTxt + " (" + str.tostring(cur.eqLo, format.mintick) + " – " + str.tostring(cur.eqHi, format.mintick) + ")\n"
+
+// ───────────────────────────────────────────── Dashboard ─────────────────────────────────────────────
+var table dash = showDash ? table.new(dashPos, 2, 6, bgcolor = color.new(#131722, 15), frame_color = color.new(#434651, 0), frame_width = 1, border_color = color.new(#434651, 40), border_width = 1) : table(na)
+
+if showDash and barstate.islast and not na(dash)
+    color tc = #D1D4DC
+    dash.cell(0, 0, "FIB-OTE", text_color = tc, text_size = size.small, text_halign = text.align_left)
+    if na(cur)
+        dash.cell(1, 0, "waiting for the first leg", text_color = tc, text_size = size.small, text_halign = text.align_left)
+    else
+        float  R    = math.abs(cur.e - cur.a)
+        float  rNow = R > 0 ? (cur.e - close) * cur.dir / R : na
+        float  oLo  = math.min(oteFrom, oteTo)
+        float  oHi  = math.max(oteFrom, oteTo)
+        string loc  = na(rNow) ? "" : rNow < 0 ? "beyond extreme" : rNow < 0.5 - eqBand ? (cur.dir == 1 ? "premium" : "discount") : rNow <= 0.5 + eqBand ? "50% area" : rNow < oLo ? (cur.dir == 1 ? "discount" : "premium") : rNow <= oHi ? "OTE" : rNow <= 1 ? "deep retrace" : "beyond origin"
+        array<int> cnt = array.new<int>(9, 0)
+        for a in cur.arrs
+            if a.qual and not a.broken and a.dk >= 0
+                cnt.set(a.dk, cnt.get(a.dk) + 1)
+        string arrTxt = ""
+        for k = 0 to 8
+            int c = cnt.get(k)
+            if c > 0
+                arrTxt += (str.length(arrTxt) > 0 ? " · " : "") + kindName(k) + " " + str.tostring(c)
+        dash.cell(1, 0, (cur.dir == 1 ? "▲ Bullish leg " : "▼ Bearish leg ") + str.tostring(cur.id) + (cur.locked ? " · retracing" : " · expanding"), text_color = legCol(cur.dir), text_size = size.small, text_halign = text.align_left)
+        dash.cell(0, 1, "Leg", text_color = tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(1, 1, str.tostring(cur.a, format.mintick) + " → " + str.tostring(cur.e, format.mintick) + "  (" + str.tostring(R / atrv, "#.#") + " ATR)", text_color = tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(0, 2, "Price", text_color = tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(1, 2, str.tostring(rNow, "#.###") + "  " + loc, text_color = loc == "OTE" or loc == "50% area" ? color.new(oteCol, 0) : tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(0, 3, "OTE", text_color = tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(1, 3, str.tostring(cur.oteLo, format.mintick) + " – " + str.tostring(cur.oteHi, format.mintick), text_color = tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(0, 4, "50%", text_color = tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(1, 4, str.tostring(cur.price(0.5), format.mintick), text_color = tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(0, 5, "Arrays", text_color = tc, text_size = size.small, text_halign = text.align_left)
+        dash.cell(1, 5, str.length(arrTxt) > 0 ? arrTxt : "none in zone", text_color = tc, text_size = size.small, text_halign = text.align_left)
+
+// ───────────────────────────────────────────── Data window & alerts ─────────────────────────────────────────────
+float pA   = na
+float pE   = na
+float pEQ  = na
+float pOH  = na
+float pOL  = na
+float pDir = na
+if not na(cur)
+    pA   := cur.a
+    pE   := cur.e
+    pEQ  := cur.price(0.5)
+    pOH  := cur.oteHi
+    pOL  := cur.oteLo
+    pDir := cur.dir
+plot(pA,   "Leg origin (1)",    color = color.gray, display = display.data_window)
+plot(pE,   "Leg extreme (0)",   color = color.gray, display = display.data_window)
+plot(pEQ,  "Equilibrium (0.5)", color = color.gray, display = display.data_window)
+plot(pOH,  "OTE upper",         color = color.gray, display = display.data_window)
+plot(pOL,  "OTE lower",         color = color.gray, display = display.data_window)
+plot(pDir, "Leg direction",     color = color.gray, display = display.data_window)
+
+alertcondition(evBull, "New bullish leg",         "FIB-OTE: new bullish expansion leg on {{ticker}} ({{interval}})")
+alertcondition(evBear, "New bearish leg",         "FIB-OTE: new bearish expansion leg on {{ticker}} ({{interval}})")
+alertcondition(evFail, "Leg failed",              "FIB-OTE: active leg failed on {{ticker}} ({{interval}})")
+alertcondition(evOTE,  "Price reached OTE",       "FIB-OTE: price reached the OTE zone on {{ticker}} ({{interval}})")
+alertcondition(evEQ,   "Price reached 50% area",  "FIB-OTE: price reached the 50% area on {{ticker}} ({{interval}})")
+alertcondition(evArr,  "New PD array in zone",    "FIB-OTE: new PD array formed in the 50%/OTE zone on {{ticker}} ({{interval}})")
+alertcondition(evTap,  "PD array in zone tapped", "FIB-OTE: price tapped a PD array in the 50%/OTE zone on {{ticker}} ({{interval}})")
+
+if alertsOn and str.length(alertTxt) > 0
+    alert("FIB-OTE " + syminfo.ticker + " " + timeframe.period + "\n" + alertTxt, alert.freq_once_per_bar_close)
